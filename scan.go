@@ -11,13 +11,36 @@ import (
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
 )
 
-type scanDBData struct {
-	itemCount        int64
-	lastEvaluatedKey map[string]*dynamodb.AttributeValue
-	items            []map[string]*dynamodb.AttributeValue
+func constructPKCounter(DBitems []map[string]*dynamodb.AttributeValue) map[string]int {
+
+	partitionKeyCount := make(map[string]int)
+
+	for _, i := range DBitems {
+		item := Item{}
+
+		err := dynamodbattribute.UnmarshalMap(i, &item)
+		taskId := item.TaskId
+		if val, ok := partitionKeyCount[taskId]; ok {
+			partitionKeyCount[taskId] = (val + 1)
+		} else {
+			partitionKeyCount[taskId] = 1
+		}
+
+		if err != nil {
+			log.Fatalf("Got error unmarshalling: %s", err)
+		}
+	}
+
+	return partitionKeyCount
+
 }
 
-// use a while loop - while ScanDB returns a Last evaluated key, do another one and increment the times
+type scanDBData struct {
+	itemCount         int64
+	lastEvaluatedKey  map[string]*dynamodb.AttributeValue
+	items             []map[string]*dynamodb.AttributeValue
+	partitionKeyCount map[string]int
+}
 
 type SDBParams struct {
 	svc           *dynamodb.DynamoDB
@@ -28,11 +51,9 @@ type SDBParams struct {
 }
 
 func ScanDB(p SDBParams) scanDBData {
-	tlimit := int64(10)
 
 	scanInput := &dynamodb.ScanInput{
 		TableName: &p.tableName,
-		Limit:     &tlimit,
 	}
 
 	if len(p.lastEvalKey) > 0 {
@@ -50,12 +71,13 @@ func ScanDB(p SDBParams) scanDBData {
 		fmt.Println(err.Error())
 	}
 
-	// constructPKCounter(result.Items)
+	pkc := constructPKCounter(result.Items)
 
 	return scanDBData{
-		itemCount:        *result.Count,
-		lastEvaluatedKey: result.LastEvaluatedKey,
-		items:            result.Items,
+		itemCount:         *result.Count,
+		lastEvaluatedKey:  result.LastEvaluatedKey,
+		items:             result.Items,
+		partitionKeyCount: pkc,
 	}
 }
 
@@ -77,34 +99,28 @@ type FTSParams struct {
 }
 
 type Item struct {
-	taskId string
+	TaskId string `json:"logGroup"`
 }
 
-func constructPKCounter(DBitems []map[string]*dynamodb.AttributeValue) {
-	for _, i := range DBitems {
-		item := Item{}
-
-		fmt.Println(i)
-
-		err := dynamodbattribute.UnmarshalMap(i, &item)
-
-		if err != nil {
-			log.Fatalf("Got error unmarshalling: %s", err)
-		}
-	}
-
-}
-
-func fullTableScan(p FTSParams) int {
+func fullTableScan(p FTSParams) (int, map[string]int) {
 	itemCount := 0
 	lastEvalKey := make(map[string]*dynamodb.AttributeValue)
 	beforeTime := time.Now()
+	fullPKCount := make(map[string]int)
 
 	for {
 		scanData := ScanDB(SDBParams{p.svc, p.tableName, lastEvalKey, p.segement, p.totalSegments})
 		lastEvalKey = scanData.lastEvaluatedKey
-		// fmt.Println(lastEvalKey)
 		itemCount = itemCount + int(scanData.itemCount)
+
+		// go through all the values in scanData.partitionKeyCount and check if present, iterate if so, add if not
+		for item, count := range scanData.partitionKeyCount {
+			if _, ok := fullPKCount[item]; ok {
+				fullPKCount[item] = (count + fullPKCount[item])
+			} else {
+				fullPKCount[item] = count
+			}
+		}
 
 		moreItems := len(scanData.lastEvaluatedKey) > 0
 		if !moreItems {
@@ -122,15 +138,17 @@ func fullTableScan(p FTSParams) int {
 	}
 	fmt.Println(totalTimeTaken)
 	fmt.Printf("Segment Item Count: %d \n", itemCount)
-	return itemCount
+	return itemCount, fullPKCount
 }
 
-func ParallelScanDB(svc *dynamodb.DynamoDB, tableName string, totalSegments int64) int {
+func ParallelScanDB(svc *dynamodb.DynamoDB, tableName string, totalSegments int64) (int, map[string]int) {
 	// show the difference in query time between parallel scan and non parallel scan
 	// talk about the eventual consitency of the data
 
 	var totalItemCount int = 0
 	beforeTime := time.Now()
+
+	fullParallelPKCount := make(map[string]int)
 
 	// measure time before and after
 	var wg sync.WaitGroup
@@ -144,8 +162,19 @@ func ParallelScanDB(svc *dynamodb.DynamoDB, tableName string, totalSegments int6
 			defer wg.Done()
 			fmt.Printf("Worker %d starting\n", i)
 			defer fmt.Printf("Worker %d done\n", i)
-			segmentItemCount := fullTableScan(FTSParams{svc, tableName, int64(i), totalSegments})
+			defer fmt.Println(fullParallelPKCount)
+			segmentItemCount, pkMap := fullTableScan(FTSParams{svc, tableName, int64(i), totalSegments})
 			totalItemCount = totalItemCount + segmentItemCount
+
+			// go through all the values in scanData.partitionKeyCount and check if present, iterate if so, add if not
+			for item, count := range pkMap {
+				if _, ok := fullParallelPKCount[item]; ok {
+					fullParallelPKCount[item] = (count + fullParallelPKCount[item])
+				} else {
+					fullParallelPKCount[item] = count
+				}
+			}
+
 		}()
 	}
 
@@ -155,20 +184,14 @@ func ParallelScanDB(svc *dynamodb.DynamoDB, tableName string, totalSegments int6
 	totalTimeTaken := afterTime.Sub(beforeTime)
 	fmt.Printf("Time Taken for parallel scan: %s \n", tableName)
 	fmt.Println(totalTimeTaken)
+	fmt.Println(fullParallelPKCount)
 
-	return totalItemCount
+	return totalItemCount, fullParallelPKCount
 }
 
 func main() {
 	fmt.Println("start")
 	svc := connection()
-	tableToScan := "test-cec-engine-switchboard"
-	itemCount := ParallelScanDB(svc, tableToScan, 20)
-	fmt.Printf("Item Count for Parallel Table Scan: %s \n", tableToScan)
-	fmt.Printf("%d \n\n", itemCount)
-	// ftItemCount := fullTableScan(FTSParams{svc, tableToScan, 0, 20})
-	// emptyKey := make(map[string]*dynamodb.AttributeValue)
-	// ScanDB(SDBParams{svc, tableToScan, emptyKey, -1, -1})
-	// fmt.Printf("Item Count for Full Table Scan: %s \n", tableToScan)
-	// fmt.Println(ftItemCount)
+	tableToScan := "test-cec-aggregated-logs"
+	ParallelScanDB(svc, tableToScan, 20)
 }

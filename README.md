@@ -11,6 +11,8 @@ go run scan.go
 
 NEXT:
 - build an object with data on the partition keys and a count of their different values:
+  - Extend ScanDB to return a partition key counter map
+  - Same with ParallelScanDB - but merge maps from each fullTableScan
 
 
 ## Findings
@@ -28,4 +30,6 @@ NEXT:
 - Segment sizes are very even.
 - The partition key is a task id, therefore it is unique and there will be an even spread of data across partitions
 
+## Talk Prep Link
+- https://paper.dropbox.com/doc/Databases-how-to-read-and-write-data-efficiently--CG44LEkEl2OSMhTcsZxcuaPfAg-DxDDIZREyqDWIipd14dbR
 
